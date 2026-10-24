@@ -3,7 +3,11 @@
 Obsidian 笔记库读写，移植自工作区的 `kira-ai-plugin-obsidian`（KiraAI Python 插件版）：七个 LLM 工具覆盖列目录、读笔记、整篇写入、追加、局部修改、删除、搜索。所有解析工作（frontmatter、文档结构、搜索打分）都在 Obsidian 一侧完成，插件只是 Obsidian 社区插件 [Local REST API](https://github.com/coddingtonbear/obsidian-local-rest-api) 的薄壳。
 
 ## 版本
-4.0.0（对应 Alife 客户端 4.2.x）
+5.0.0（对应 Alife 客户端 5.0.x；本机 5.0.2 在役客户端已热编译装载成功）
+
+## 5.0.0 的改动
+- 版本号对齐客户端主版本（官方约定：插件版本首位应与客户端一致，`PluginSystem.IsClientCompatible` 按主版本判定）
+- 只走本地 REST API（HTTP），未涉及外部程序与平台 API；本版只做版本对齐与在役客户端装载确认
 
 ## 依赖
 - Alife.Function.FunctionCaller
