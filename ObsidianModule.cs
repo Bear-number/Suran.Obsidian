@@ -34,6 +34,19 @@ public class ObsidianConfig
     [Description("Obsidian 的 HTTPS 端点用插件自己生成的本地 CA 签发证书，系统默认不认，开着才能连 https 地址。回调只作用于本插件这一个 HttpClient。如果已经把 https://127.0.0.1:27124/obsidian-local-rest-api.crt 下载并装进系统受信任根证书，可以关掉")]
     public bool TrustSelfSignedCertificate { get; set; } = true;
 
+    [DisplayName("知识库·vault 本地目录")]
+    [Description("半区二（wiki_* 四个工具）要的是本地磁盘绝对路径，形如 D:\\我的obsidian知识库；与 note_* 用的「vault 内相对路径」不是一回事。留空则 wiki_* 全部报未配置")]
+    public string VaultPath { get; set; } = "";
+
+    [DisplayName("知识库·允许文件系统写入")]
+    [Description("开着才允许 wiki_page 写/删、wiki_index 重建索引（都限制在该目录之内的 .md，核心页 index/log/overview/conventions 不给删）。关掉只剩读与体检")]
+    public bool WikiAllowFileWrite { get; set; } = true;
+
+    [DisplayName("知识库·单次收录最多页数")
+    ]
+    [Description("wiki_ingest 一次最多让模型编出几页（1-200），超出的丢掉并说明")]
+    public int IngestMaxPages { get; set; } = 15;
+
     [DisplayName("输出·结果最大字符数")]
     [Description("note_read/note_list/note_search 的输出超过这个字符数就截断并标注，取值 500-20000")]
     public int MaxOutputChars { get; set; } = 8000;
@@ -48,9 +61,9 @@ public class ObsidianConfig
 }
 
 [Module("Obsidian笔记操作",
-    "读写 Obsidian 笔记库（vault）：列目录、读笔记（正文/元数据/大纲）、整篇写入、追加、按标题或块引用或 frontmatter 局部修改、删除、搜索（关键词与 JsonLogic）。全部经 Obsidian 社区插件 Local REST API 完成，frontmatter 解析、文档结构、搜索打分都在 Obsidian 侧",
+    "两半区：① 笔记操作（note_*）经 Obsidian 社区插件 Local REST API 读写 vault——列目录、读正文/元数据/大纲、整篇或定点改、搜索；② 知识库维护（wiki_*）直接吃文件系统——体检（空页/断链/孤立页）、重建索引、按关键词找页、读写页面，Obsidian 没开着也能用",
     defaultCategory: "苏染的工具")]
-public class ObsidianModule(
+public partial class ObsidianModule(
     XmlFunctionCaller functionCaller,
     ILogger<ObsidianModule> logger,
     Interactor<ObsidianModule> interactor
@@ -75,29 +88,42 @@ public class ObsidianModule(
     {
         baseUrl = Configuration.BaseUrl.Trim().TrimEnd('/');
         timeoutSeconds = Math.Clamp(Configuration.RequestTimeoutSeconds, 5, 120);
+        vaultPath = Configuration.VaultPath.Trim().TrimEnd('\\', '/');
         if (baseUrl.Length > 0)
         {
             httpClient = BuildHttpClient();
-            logger.LogInformation("[Obsidian] 笔记工具已就绪 {BaseUrl}（7 个工具）", baseUrl);
+            logger.LogInformation("[Obsidian] REST 半区已就绪 {BaseUrl}（5 个 note_* 工具）", baseUrl);
         }
         else
         {
-            logger.LogWarning("[Obsidian] 未配置 Local REST API 地址，七个笔记工具都会报未配置");
+            logger.LogWarning("[Obsidian] 未配置 Local REST API 地址，note_* 五个工具都会报未配置");
+        }
+        if (vaultPath.Length > 0)
+        {
+            logger.LogInformation("[Obsidian] 知识库半区指向 {Vault}，文件系统写入 {Write}（4 个 wiki_* 工具）",
+                vaultPath, Configuration.WikiAllowFileWrite ? "开" : "关");
+        }
+        else
+        {
+            logger.LogWarning("[Obsidian] 未配置「知识库·vault 本地目录」，wiki_* 四个工具都会报未配置");
         }
 
         XmlHandler handler = new(this)
         {
-            Description = "Obsidian 笔记库读写（路径是 vault 内部相对路径，不是本地磁盘路径）：列目录、读笔记、整篇写入、追加、局部修改、删除、搜索。",
-            Explanation = "先决条件是 Obsidian 开着、社区插件 Local REST API 已启用、本插件配置填了地址与密钥，否则七个工具都会报连不上。"
-                + "路径形如 01-architecture/design.md，不带盘符、不带前导斜杠。"
-                + "找内容优先 note_search，浏览结构才用 note_list。改已有笔记的某一节用 note_patch，不要整篇 note_write 覆盖；"
-                + "日记、流水记录这类追加用 note_append。"
-                + "note_write、note_append、note_patch 三个要把正文写在开闭标签之间，别塞进属性里。"
-                + "note_delete 默认按 Obsidian 的删除文件设置进回收站，不是物理删除，但动手前仍要跟对方核对路径。",
+            Description = "两半区：note_* 经 Obsidian 的 Local REST API 读写笔记（列目录、读、定点改、搜索、写入/追加/删除合一的 note_edit）；"
+                + "wiki_* 直接吃文件系统做知识库维护（体检、重建索引、关键词找页、读写页面），不要求 Obsidian 在跑。",
+            Explanation = "note_* 的先决条件是 Obsidian 开着、社区插件 Local REST API 已启用、配置里填了地址与密钥；路径形如 01-architecture/design.md，不带盘符、不带前导斜杠。"
+                + "wiki_* 只要配置里填了「知识库·vault 本地目录」（本地绝对路径）就能用，路径是知识库内相对路径。"
+                + "找内容：Obsidian 在跑优先 note_search（用它自己的索引，支持 tags/frontmatter 的 jsonlogic），没跑或要看生成区结构就 wiki_search。"
+                + "浏览结构用 note_list。改已有笔记的某一节用 note_patch，不要整篇覆盖；整篇写/追加/删除都在 note_edit 的 mode 里。"
+                + "知识库那套目录（raw/ 素材 + wiki/ 的 sources|entities|concepts|analyses 四分区 + index/log/overview/conventions 核心页）用 wiki_page 读写，"
+                + "新建或大改后跑 wiki_index 重建索引；库脏了跑 wiki_status 看空页/断链/孤立页。"
+                + "note_edit、note_patch、wiki_page 三个要把正文写在开闭标签之间，别塞进属性里。"
+                + "删除都要先跟对方核对路径：note_edit 的 delete 走 Obsidian 回收站，wiki_page 的 delete 是文件系统直接抹掉。",
         };
         functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
         // 纯文本区按标签名生效，这里是上面显式指定的下划线标签名，不是方法名
-        functionCaller.AddPlainAreas("note_write", "note_append", "note_patch");
+        functionCaller.AddPlainAreas("note_edit", "note_patch", "wiki_page");
         return Task.CompletedTask;
     }
 
@@ -169,49 +195,41 @@ public class ObsidianModule(
         interactor.Poke(Truncate("[" + normalized + " | " + resolvedMode + "]\n" + body));
     }
 
-    [XmlFunction(FunctionMode.Content, "note_write")]
-    [Description("整篇写入 Obsidian 笔记（不存在则创建，已存在则内容全被覆盖！）。开闭标签之间放完整 Markdown 正文；只想改某一节用 note_patch，追加用 note_append")]
-    public async Task NoteWrite(
+    [XmlFunction(FunctionMode.Content, "note_edit")]
+    [Description("写 Obsidian 笔记，三种模式一次只做一个：replace（整篇覆盖，不存在则创建）、append（追加到末尾，适合日记流水）、delete（删除该篇）。"
+        + "replace/append 把 Markdown 正文放在开闭标签之间，delete 标签留空。只想改某一节别用 replace，用 note_patch")]
+    public async Task NoteEdit(
         XmlExecutorContext context,
-        [Description("笔记路径，如 reports/test.md")] string path)
+        [Description("笔记路径，如 reports/test.md（vault 内相对路径，不带盘符）")] string path,
+        [Description("replace（默认）/ append / delete")] string mode = "replace")
     {
         if (context.CallMode != CallMode.Closing)
         {
             return;
         }
-        string normalized = RequirePath(path, "note_write");
+        string normalized = RequirePath(path, "note_edit");
+        string resolvedMode = RequireOneOf(mode, "note_edit 的 mode", "replace", "append", "delete");
+        if (resolvedMode == "delete")
+        {
+            await RequestAsync(HttpMethod.Delete, "/vault/" + normalized);
+            interactor.Poke("已删除 " + normalized + "（按 Obsidian 的删除设置进回收站，不是物理删除，要恢复得在 Obsidian 里找）");
+            return;
+        }
         string content = context.FullContent;
         if (content.Trim().Length == 0)
         {
             // 空标签体意味着这次调用写漏了正文，直接放过就会把整篇笔记抹掉
-            throw new Exception("note_write 收到空正文，已拒绝执行（继续下去会把 " + normalized + " 整篇覆盖成空的）");
+            throw new Exception("note_edit 的 " + resolvedMode + " 要在开闭标签之间给出正文；"
+                + (resolvedMode == "replace" ? "空着执行会把 " + normalized + " 整篇覆盖成空的，已拒绝" : "这次没有任何内容可追加"));
         }
-        await RequestAsync(HttpMethod.Put, "/vault/" + normalized, content);
-        interactor.Poke("已写入 " + normalized + "（" + content.Length + " 字符，整篇覆盖）");
-    }
-
-    [XmlFunction(FunctionMode.Content, "note_append")]
-    [Description("把内容追加到 Obsidian 笔记末尾（笔记不存在则创建），已有内容不动。开闭标签之间放要追加的 Markdown。适合日记、流水记录")]
-    public async Task NoteAppend(
-        XmlExecutorContext context,
-        [Description("笔记路径，如 reports/log.md")] string path)
-    {
-        if (context.CallMode != CallMode.Closing)
-        {
-            return;
-        }
-        string normalized = RequirePath(path, "note_append");
-        string content = context.FullContent;
-        if (content.Trim().Length == 0)
-        {
-            throw new Exception("note_append 收到空正文，没有执行任何追加");
-        }
-        await RequestAsync(HttpMethod.Post, "/vault/" + normalized, content);
-        interactor.Poke("已追加到 " + normalized + "（" + content.Length + " 字符）。Obsidian 会自己补上分隔空行，追加内容总是独立成块");
+        await RequestAsync(resolvedMode == "replace" ? HttpMethod.Put : HttpMethod.Post, "/vault/" + normalized, content);
+        interactor.Poke(resolvedMode == "replace"
+            ? "已写入 " + normalized + "（" + content.Length + " 字符，整篇覆盖）"
+            : "已追加到 " + normalized + "（" + content.Length + " 字符）。Obsidian 会自己补上分隔空行，追加内容总是独立成块");
     }
 
     [XmlFunction(FunctionMode.Content, "note_patch")]
-    [Description("只改 Obsidian 笔记里的某一处，不动整篇。开闭标签之间放要写进去的内容（frontmatter 时放 JSON 值，delete 时留空）。文件必须已存在，新建用 note_write")]
+    [Description("只改 Obsidian 笔记里的某一处，不动整篇。开闭标签之间放要写进去的内容（frontmatter 时放 JSON 值，delete 时留空）。文件必须已存在，新建用 note_edit")]
     public async Task NotePatch(
         XmlExecutorContext context,
         [Description("笔记路径，如 01-architecture/design.md")] string path,
@@ -257,16 +275,6 @@ public class ObsidianModule(
 
         string body = await RequestAsync(new HttpMethod("PATCH"), "/vault/" + normalized, instruction.ToJsonString(), TypePatchInstruction);
         interactor.Poke("已局部修改 " + normalized + "：" + resolvedOperation + " " + resolvedTargetType + "「" + target + "」，改完全文 " + body.Length + " 字符（要看结果用 note_read）");
-    }
-
-    [XmlFunction(FunctionMode.OneShot, "note_delete")]
-    [Description("删除 Obsidian 笔记库里的一篇笔记。默认按 Obsidian 的删除文件设置进回收站（.trash 或系统回收站），不是物理删除；即便如此也应在对方明确要求下再用，并先核对路径")]
-    public async Task NoteDelete(
-        [Description("要删除的笔记路径，如 reports/old-note.md")] string path)
-    {
-        string normalized = RequirePath(path, "note_delete");
-        await RequestAsync(HttpMethod.Delete, "/vault/" + normalized);
-        interactor.Poke("已删除 " + normalized + "（按 Obsidian 的删除设置进回收站，要恢复得在 Obsidian 里找）");
     }
 
     [XmlFunction(FunctionMode.OneShot, "note_search")]
