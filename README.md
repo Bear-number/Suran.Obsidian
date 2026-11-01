@@ -6,7 +6,12 @@ Obsidian 笔记库操作，**两个半区**：
 - **wiki_\*（直接吃文件系统）**：知识库体检（空页/断链/孤立页/未初始化）、重建索引、关键词找页、读写页面、把素材编译成整本页面（`wiki_ingest`）。**Obsidian 没开着也能用**，路径限制在配置的 vault 目录之内。这一半移植自 KiraAI 的 `kira_wiki` 插件（`wiki_core.py`，纯标准库那部分；它的面板带不过来——Alife 没有侧边栏宿主，图谱与双链跳转直接用 Obsidian 本体看）。
 
 ## 版本
-5.1.1（对应 Alife 客户端 5.0.x）
+5.1.2（对应 Alife 客户端 5.0.x）
+
+## 5.1.2 的改动
+- **修 `wiki_status` 必崩**：`VaultWiki.Lint` 里 `pages.ToDictionary(page => page.Name, _ => 0)` 用页名当键，而真实 vault 里每个目录都有一个 `README.md`（`01-技术/`、`02-生活/`、`03-人物/`、`09-收件箱/` 各一份），键一重复就抛 `ArgumentException: An item with the same key has already been added. Key: README`，整个体检直接红
+- 改成先建空字典再 `TryAdd` 去重：同名页面共享一份入链计数，体检照常出结果。**这条不是某个 vault 的特例**——只要库里有第二个同名笔记（`index.md`、`readme.md` 一样常见），旧代码就 100% 崩
+- 验证：拿 7 页的真实 vault（含 4 个 README.md）跑探针，`Scan` / `Lint` / `Rank` / `ResolveTarget` / `WritePage` / `RebuildIndex` / `AppendLog` / `SaveRaw` / `PlanCompiled` / `WriteDrafts` 全绿；`Lint` 现在正常报出「未初始化（还没建 wiki/）」「raw/ 里还没有素材」两条，这正是这个库该有的结论
 
 ## 5.1.1 的改动
 - **修：客户端 5.0 之后本插件编译不过**（`error CS1501: No overload for method 'ChatStreamingAsync' takes 6 arguments`）。宿主在 5.0 里把 `ILanguageModel.ChatStreamingAsync` 从 6 参数改成 4 参数，返回值也从 `string` 换成了 `ChatResult`：旧的 `(thread, textReceived, thinkReceived, tokenUsed, exceptionThrow, ct)` → 新的 `(thread, textReceived, thinkReceived, ct)`，`tokenUsed` 挪到 `ITokenUser.TokenUsed` 事件上报，`exceptionThrow` 回调取消

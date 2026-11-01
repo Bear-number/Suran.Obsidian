@@ -316,7 +316,13 @@ public static class VaultWiki
         List<Page> pages = Scan(root);
         report.Pages.AddRange(pages);
         HashSet<string> names = pages.Select(page => page.Name).ToHashSet(StringComparer.Ordinal);
-        Dictionary<string, int> incoming = pages.ToDictionary(page => page.Name, _ => 0);
+        //同名页面在真实 vault 里躲不掉（每个目录一个 README.md、index.md），
+        //用 ToDictionary 会直接抛「An item with the same key has already been added」，所以按键去重、只留一份计数
+        Dictionary<string, int> incoming = new(StringComparer.Ordinal);
+        foreach (Page page in pages)
+        {
+            incoming.TryAdd(page.Name, 0);
+        }
         foreach (Page page in pages.Where(page => page.Section != "root"))
         {
             string file = PageFile(root, page);
