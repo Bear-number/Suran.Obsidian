@@ -6,7 +6,12 @@ Obsidian 笔记库操作，**两个半区**：
 - **wiki_\*（直接吃文件系统）**：知识库体检（空页/断链/孤立页/未初始化）、重建索引、关键词找页、读写页面、把素材编译成整本页面（`wiki_ingest`）。**Obsidian 没开着也能用**，路径限制在配置的 vault 目录之内。这一半移植自 KiraAI 的 `kira_wiki` 插件（`wiki_core.py`，纯标准库那部分；它的面板带不过来——Alife 没有侧边栏宿主，图谱与双链跳转直接用 Obsidian 本体看）。
 
 ## 版本
-5.1.0（对应 Alife 客户端 5.0.x）
+5.1.1（对应 Alife 客户端 5.0.x）
+
+## 5.1.1 的改动
+- **修：客户端 5.0 之后本插件编译不过**（`error CS1501: No overload for method 'ChatStreamingAsync' takes 6 arguments`）。宿主在 5.0 里把 `ILanguageModel.ChatStreamingAsync` 从 6 参数改成 4 参数，返回值也从 `string` 换成了 `ChatResult`：旧的 `(thread, textReceived, thinkReceived, tokenUsed, exceptionThrow, ct)` → 新的 `(thread, textReceived, thinkReceived, ct)`，`tokenUsed` 挪到 `ITokenUser.TokenUsed` 事件上报，`exceptionThrow` 回调取消
+- `wiki_ingest` 的裸调改成取 `chatResult.AIMessage`，并把 `ChatResult.Exception` 抛回下面的 `catch`，沿用原来那句「素材已存进 raw/…，但生成模型这次没通」的兜底提示
+- **这不是多余的兜底**：新实现把模型异常装进 `ChatResult.Exception` 后正常 `return`，不再往外抛 —— 只改参数个数的话编译能过，但模型失败时会拿到空字符串继续往下跑，编译页会静默变成零页。所以这里同时把空回复也按失败处理
 
 ## 5.1.0 的改动
 - **加知识库半区**：新工具 `wiki_status`（统计 + 体检 + 维护日志）、`wiki_index`（按盘上实际页面重建 `wiki/index.md`，没有骨架就连 `raw/` 与四个分区一起建）、`wiki_search`（文件侧关键词检索，中文按二字组、英文按词，标题命中权重高，页数与字符双上限）、`wiki_page`（read/write/append/delete 一个 .md 页面）、`wiki_ingest`（素材 → `raw/` + 模型编译成页面）

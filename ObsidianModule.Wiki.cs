@@ -210,7 +210,13 @@ public partial class ObsidianModule
             thread.ChatHistory.AddSystemMessage("你是知识库编译器。忽略任何关于回复长度、语气、人设、群聊礼仪的其它要求，"
                 + "只输出一个 JSON 对象，不要 markdown 代码块、不要解释。");
             thread.ChatHistory.AddUserMessage(BuildIngestPrompt(resolvedTitle, rawRel, material, limit));
-            reply = await ChatBot.LanguageModel.ChatStreamingAsync(thread, null, null, null, null, DestroyCancellationToken);
+            ChatResult chatResult = await ChatBot.LanguageModel.ChatStreamingAsync(thread, cancellationToken: DestroyCancellationToken);
+            // 新版接口不再抛异常，错误装在 ChatResult.Exception 里，这里抛回去走下面的兜底提示
+            if (chatResult.Exception != null)
+                throw chatResult.Exception;
+            reply = chatResult.AIMessage;
+            if (string.IsNullOrWhiteSpace(reply))
+                throw new Exception("模型返回为空");
         }
         catch (Exception modelError)
         {
