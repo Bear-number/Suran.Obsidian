@@ -19,7 +19,7 @@ namespace Suran.Obsidian;
 public class ObsidianConfig
 {
     [DisplayName("连接·Local REST API 地址")]
-    [Description("Obsidian 社区插件 Local REST API 设置页上显示的服务地址。5.x 默认是 https://127.0.0.1:27124（本地自签证书，要靠下面『信任自签证书』才连得上）；在设置里勾了 Enable HTTP server 也可以填明文 http://127.0.0.1:27123。留空则七个工具全部直接报未配置")]
+    [Description("Local REST API 的服务地址。")]
     public string BaseUrl { get; set; } = "";
 
     [DisplayName("连接·API Key")]
@@ -31,15 +31,15 @@ public class ObsidianConfig
     public int RequestTimeoutSeconds { get; set; } = 15;
 
     [DisplayName("连接·信任自签证书")]
-    [Description("Obsidian 的 HTTPS 端点用插件自己生成的本地 CA 签发证书，系统默认不认，开着才能连 https 地址。回调只作用于本插件这一个 HttpClient。如果已经把 https://127.0.0.1:27124/obsidian-local-rest-api.crt 下载并装进系统受信任根证书，可以关掉")]
+    [Description("是否信任本地自签证书，连 https 地址需要开。")]
     public bool TrustSelfSignedCertificate { get; set; } = true;
 
     [DisplayName("知识库·vault 本地目录")]
-    [Description("半区二（wiki_* 四个工具）要的是本地磁盘绝对路径，形如 D:\\我的obsidian知识库；与 note_* 用的「vault 内相对路径」不是一回事。留空则 wiki_* 全部报未配置")]
+    [Description("wiki_* 工具用的本地知识库绝对路径，留空则报未配置。")]
     public string VaultPath { get; set; } = "";
 
     [DisplayName("知识库·允许文件系统写入")]
-    [Description("开着才允许 wiki_page 写/删、wiki_index 重建索引（都限制在该目录之内的 .md，核心页 index/log/overview/conventions 不给删）。关掉只剩读与体检")]
+    [Description("是否允许 wiki_page 写删与索引重建，默认关。")]
     public bool WikiAllowFileWrite { get; set; } = true;
 
     [DisplayName("知识库·单次收录最多页数")
@@ -62,7 +62,8 @@ public class ObsidianConfig
 
 [Module("Obsidian笔记操作",
     "两半区：① 笔记操作（note_*）经 Obsidian 社区插件 Local REST API 读写 vault——列目录、读正文/元数据/大纲、整篇或定点改、搜索；② 知识库维护（wiki_*）直接吃文件系统——体检（空页/断链/孤立页）、重建索引、按关键词找页、读写页面，Obsidian 没开着也能用",
-    defaultCategory: "苏染的工具")]
+    defaultCategory: "苏染的工具",
+    EditorUI = typeof(ObsidianUI))]
 public partial class ObsidianModule(
     XmlFunctionCaller functionCaller,
     ILogger<ObsidianModule> logger,
