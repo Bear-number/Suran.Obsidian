@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -26,6 +27,10 @@ public class ObsidianConfig
     [Description("Local REST API 设置页生成的密钥，按 Authorization: Bearer 发出。留空一律 401；填错累积到十次/分钟会被服务端 429 限速一整分钟")]
     public string ApiKey { get; set; } = "";
 
+    [DisplayName("连接·自动读取 Local REST API 配置")]
+    [Description("开启后，地址或密钥留空时会尝试从 vault 的 .obsidian/plugins/obsidian-local-rest-api/data.json 读取端口与密钥")]
+    public bool AutoDetectRestApi { get; set; } = true;
+
     [DisplayName("连接·请求超时(秒)")]
     [Description("单次 HTTP 请求超时，取值 5-120。读长笔记和搜大库要留够时间")]
     public int RequestTimeoutSeconds { get; set; } = 15;
@@ -39,8 +44,12 @@ public class ObsidianConfig
     public string VaultPath { get; set; } = "";
 
     [DisplayName("知识库·允许文件系统写入")]
-    [Description("是否允许 wiki_page 写删与索引重建，默认关。")]
-    public bool WikiAllowFileWrite { get; set; } = true;
+    [Description("是否允许 wiki_* 写删与索引重建，默认关。")]
+    public bool WikiAllowFileWrite { get; set; } = false;
+
+    [DisplayName("知识库·体检外部笔记断链")]
+    [Description("开启后体检也会检查外部笔记里的断链；默认只查生成区，避免大库刷屏。")]
+    public bool CheckExternalLinks { get; set; } = false;
 
     [DisplayName("知识库·单次收录最多页数")
     ]
@@ -62,7 +71,7 @@ public class ObsidianConfig
 
 [Module("Obsidian笔记操作",
     "两半区：① 笔记操作（note_*）经 Obsidian 社区插件 Local REST API 读写 vault——列目录、读正文/元数据/大纲、整篇或定点改、搜索；② 知识库维护（wiki_*）直接吃文件系统——体检（空页/断链/孤立页）、重建索引、按关键词找页、读写页面，Obsidian 没开着也能用",
-    defaultCategory: "苏染的工具",
+    defaultCategory: "苏染的工具/效率工具",
     EditorUI = typeof(ObsidianUI))]
 public partial class ObsidianModule(
     XmlFunctionCaller functionCaller,
@@ -82,45 +91,47 @@ public partial class ObsidianModule(
     HttpClient? httpClient;
     string baseUrl = "";
     int timeoutSeconds = 15;
+    string patchWarnings = "";
 
     sealed record NoteEntry(string Path, bool IsFolder);
 
     protected override Task OnAwake()
     {
+        if (Configuration.AutoDetectRestApi)
+        {
+            TryAutoDetectRestApi();
+        }
         baseUrl = Configuration.BaseUrl.Trim().TrimEnd('/');
         timeoutSeconds = Math.Clamp(Configuration.RequestTimeoutSeconds, 5, 120);
         vaultPath = Configuration.VaultPath.Trim().TrimEnd('\\', '/');
         if (baseUrl.Length > 0)
         {
             httpClient = BuildHttpClient();
-            logger.LogInformation("[Obsidian] REST 半区已就绪 {BaseUrl}（5 个 note_* 工具）", baseUrl);
+            logger.LogInformation("[Obsidian] REST 半区已就绪 {BaseUrl}", baseUrl);
         }
         else
         {
-            logger.LogWarning("[Obsidian] 未配置 Local REST API 地址，note_* 五个工具都会报未配置");
+            logger.LogWarning("[Obsidian] 未配置 Local REST API 地址，note_* 工具都会报未配置");
         }
         if (vaultPath.Length > 0)
         {
-            logger.LogInformation("[Obsidian] 知识库半区指向 {Vault}，文件系统写入 {Write}（4 个 wiki_* 工具）",
+            logger.LogInformation("[Obsidian] 知识库半区指向 {Vault}，文件系统写入 {Write}",
                 vaultPath, Configuration.WikiAllowFileWrite ? "开" : "关");
         }
         else
         {
-            logger.LogWarning("[Obsidian] 未配置「知识库·vault 本地目录」，wiki_* 四个工具都会报未配置");
+            logger.LogWarning("[Obsidian] 未配置「知识库·vault 本地目录」，wiki_* 工具都会报未配置");
         }
 
         XmlHandler handler = new(this)
         {
-            Description = "两半区：note_* 经 Obsidian 的 Local REST API 读写笔记（列目录、读、定点改、搜索、写入/追加/删除合一的 note_edit）；"
-                + "wiki_* 直接吃文件系统做知识库维护（体检、重建索引、关键词找页、读写页面），不要求 Obsidian 在跑。",
-            Explanation = "note_* 的先决条件是 Obsidian 开着、社区插件 Local REST API 已启用、配置里填了地址与密钥；路径形如 01-architecture/design.md，不带盘符、不带前导斜杠。"
-                + "wiki_* 只要配置里填了「知识库·vault 本地目录」（本地绝对路径）就能用，路径是知识库内相对路径。"
-                + "找内容：Obsidian 在跑优先 note_search（用它自己的索引，支持 tags/frontmatter 的 jsonlogic），没跑或要看生成区结构就 wiki_search。"
-                + "浏览结构用 note_list。改已有笔记的某一节用 note_patch，不要整篇覆盖；整篇写/追加/删除都在 note_edit 的 mode 里。"
-                + "知识库那套目录（raw/ 素材 + wiki/ 的 sources|entities|concepts|analyses 四分区 + index/log/overview/conventions 核心页）用 wiki_page 读写，"
-                + "新建或大改后跑 wiki_index 重建索引；库脏了跑 wiki_status 看空页/断链/孤立页。"
-                + "note_edit、note_patch、wiki_page 三个要把正文写在开闭标签之间，别塞进属性里。"
-                + "删除都要先跟对方核对路径：note_edit 的 delete 走 Obsidian 回收站，wiki_page 的 delete 是文件系统直接抹掉。",
+            Description = "两半区：note_* 经 Obsidian 的 Local REST API 读写笔记（浏览、读、搜索、定点改、整篇写、附件、移动、环境检查）；"
+                + "wiki_* 直接吃文件系统做知识库维护（体检、索引、BM25 检索、读写、收录、改名合并），不要求 Obsidian 在跑。",
+            Explanation = "note_* 的前提是 Obsidian 开着、Local REST API 已启用；地址或密钥留空时会自动从插件的 data.json 读取。路径是 vault 内相对路径，不带盘符和前导斜杠。"
+                + "wiki_* 只要配置「知识库·vault 本地目录」；写删受「允许文件系统写入」控制。"
+                + "找内容优先 kb_search（Obsidian 在跑走 REST，失败转文件系统）；note_search 支持 page/limit，wiki_search 支持 section/tag/最近天数。"
+                + "note_patch 支持 batch 数组一次改多处；note_upload/move/rename 处理附件与移动；wiki_rename/wiki_merge 会自动改双链。"
+                + "note_edit/note_patch/wiki_page 的正文写在开闭标签之间；删除会进 Obsidian 回收站或 vault 的 .trash/，但仍要先核对路径。",
         };
         functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
         // 纯文本区按标签名生效，这里是上面显式指定的下划线标签名，不是方法名
@@ -213,6 +224,7 @@ public partial class ObsidianModule(
         if (resolvedMode == "delete")
         {
             await RequestAsync(HttpMethod.Delete, "/vault/" + normalized);
+            TryAudit("删除 " + normalized);
             interactor.Poke("已删除 " + normalized + "（按 Obsidian 的删除设置进回收站，不是物理删除，要恢复得在 Obsidian 里找）");
             return;
         }
@@ -224,27 +236,34 @@ public partial class ObsidianModule(
                 + (resolvedMode == "replace" ? "空着执行会把 " + normalized + " 整篇覆盖成空的，已拒绝" : "这次没有任何内容可追加"));
         }
         await RequestAsync(resolvedMode == "replace" ? HttpMethod.Put : HttpMethod.Post, "/vault/" + normalized, content);
+        TryAudit(resolvedMode + " " + normalized + "（" + content.Length + " 字符）");
         interactor.Poke(resolvedMode == "replace"
             ? "已写入 " + normalized + "（" + content.Length + " 字符，整篇覆盖）"
             : "已追加到 " + normalized + "（" + content.Length + " 字符）。Obsidian 会自己补上分隔空行，追加内容总是独立成块");
     }
 
     [XmlFunction(FunctionMode.Content, "note_patch")]
-    [Description("只改 Obsidian 笔记里的某一处，不动整篇。开闭标签之间放要写进去的内容（frontmatter 时放 JSON 值，delete 时留空）。文件必须已存在，新建用 note_edit")]
+    [Description("只改笔记里的某一处。单条：operation+targetType+target+scope；批量：batch 传 JSON 数组，每项含 operation/targetType/target/content 或 value。文件必须已存在，新建用 note_edit")]
     public async Task NotePatch(
         XmlExecutorContext context,
         [Description("笔记路径，如 01-architecture/design.md")] string path,
-        [Description("append（目标末尾追加）/ prepend（目标开头插入）/ replace（替换目标）/ delete（删除目标）")] string operation,
-        [Description("heading（标题）/ block（块引用）/ frontmatter（YAML 字段）")] string targetType,
-        [Description("目标名。标题从最外层逐级往下、用 :: 分隔（如 主标题::子标题），也可以直接给 JSON 数组 [\"主标题\",\"子标题\"]；块引用给不含 ^ 的 id；frontmatter 给字段名")] string target,
-        [Description("改动范围：content（默认，只动正文区）/ marker（只动标题行或块标记本身，改名用）/ markerAndContent（标记连同正文一起）")] string scope = "content",
-        [Description("目标小节不存在时是否顺手创建，默认 false")] bool createIfMissing = false)
+        [Description("append / prepend / replace / delete（单条模式用）")] string operation = "append",
+        [Description("heading / block / frontmatter（单条模式用）")] string targetType = "heading",
+        [Description("目标名。标题逐级用 :: 分隔或 JSON 数组；块给不带 ^ 的 id；frontmatter 给字段名")] string target = "",
+        [Description("content / marker / markerAndContent")] string scope = "content",
+        [Description("目标小节不存在时顺手创建，默认 false")] bool createIfMissing = false,
+        [Description("批量模式：JSON 数组，每项 {operation,targetType,target,scope?,content?/value?}；给了就忽略单条参数")] string batch = "")
     {
         if (context.CallMode != CallMode.Closing)
         {
             return;
         }
         string normalized = RequirePath(path, "note_patch");
+        if (batch.Trim().Length > 0)
+        {
+            await PatchBatchAsync(normalized, batch);
+            return;
+        }
         string resolvedOperation = RequireOneOf(operation, "note_patch 的 operation", "append", "prepend", "replace", "delete");
         string resolvedTargetType = RequireOneOf(targetType, "note_patch 的 targetType", "heading", "block", "frontmatter");
         string resolvedScope = RequireOneOf(scope, "note_patch 的 scope", "content", "marker", "markerAndContent");
@@ -275,14 +294,103 @@ public partial class ObsidianModule(
         }
 
         string body = await RequestAsync(new HttpMethod("PATCH"), "/vault/" + normalized, instruction.ToJsonString(), TypePatchInstruction);
-        interactor.Poke("已局部修改 " + normalized + "：" + resolvedOperation + " " + resolvedTargetType + "「" + target + "」，改完全文 " + body.Length + " 字符（要看结果用 note_read）");
+        TryAudit("补丁 " + normalized + "：" + resolvedOperation + " " + resolvedTargetType + "「" + target + "」");
+        string warningText = patchWarnings.Length > 0 ? "\n服务端补丁警告：" + patchWarnings : "";
+        interactor.Poke("已局部修改 " + normalized + "：" + resolvedOperation + " " + resolvedTargetType + "「" + target + "」，改完全文 " + body.Length + " 字符（要看结果用 note_read）" + warningText);
+    }
+
+    /// <summary>Local REST API 的 PATCH 支持一次发一组指令，批量改标题/字段时省往返。</summary>
+    async Task PatchBatchAsync(string normalized, string batch)
+    {
+        JsonNode? parsed;
+        try
+        {
+            parsed = JsonNode.Parse(batch);
+        }
+        catch (Exception error)
+        {
+            throw new Exception("note_patch 的 batch 不是合法 JSON：" + error.Message);
+        }
+        if (parsed is not JsonArray array || array.Count == 0)
+        {
+            throw new Exception("note_patch 的 batch 要是一个非空 JSON 数组");
+        }
+        JsonArray instructions = new();
+        foreach (JsonNode? node in array)
+        {
+            if (node is not JsonObject item)
+            {
+                throw new Exception("note_patch 的 batch 每项都必须是对象");
+            }
+            string operation = RequireOneOf(JsonField(item, "operation", "append"), "batch 的 operation", "append", "prepend", "replace", "delete");
+            string targetType = RequireOneOf(JsonField(item, "targetType", "heading"), "batch 的 targetType", "heading", "block", "frontmatter");
+            string scope = RequireOneOf(JsonField(item, "scope", "content"), "batch 的 scope", "content", "marker", "markerAndContent");
+            JsonNode? targetNode = item["target"];
+            if (targetNode == null)
+            {
+                throw new Exception("note_patch 的 batch 每项都要有 target");
+            }
+            JsonObject instruction = new()
+            {
+                ["targetType"] = targetType,
+                ["target"] = BuildBatchTarget(targetType, targetNode),
+                ["operation"] = operation,
+            };
+            if (scope != "content")
+            {
+                instruction["scope"] = scope;
+            }
+            if (item["createIfMissing"] is JsonValue create && create.TryGetValue<bool>(out bool createValue) && createValue)
+            {
+                instruction["createTargetIfMissing"] = true;
+            }
+            if (operation != "delete")
+            {
+                JsonNode? payload = item["content"] ?? item["value"];
+                if (payload == null)
+                {
+                    throw new Exception("batch 的 " + operation + " 指令缺 content 或 value");
+                }
+                if (targetType == "frontmatter")
+                {
+                    instruction["value"] = payload.DeepClone();
+                }
+                else
+                {
+                    instruction["content"] = payload is JsonValue ? payload.DeepClone() : JsonValue.Create(payload.ToJsonString());
+                }
+            }
+            instructions.Add(instruction);
+        }
+        string body = await RequestAsync(new HttpMethod("PATCH"), "/vault/" + normalized, instructions.ToJsonString(), TypePatchInstruction);
+        TryAudit("批量补丁 " + normalized + "：" + instructions.Count + " 条");
+        string warningText = patchWarnings.Length > 0 ? "\n服务端补丁警告：" + patchWarnings : "";
+        interactor.Poke("已批量修改 " + normalized + "：" + instructions.Count + " 条指令，改完全文 " + body.Length + " 字符（要看结果用 note_read）" + warningText);
+    }
+
+    static string JsonField(JsonObject item, string name, string fallback)
+    {
+        JsonNode? node = item[name];
+        return node is JsonValue value && value.TryGetValue<string>(out string? text) ? text ?? fallback : fallback;
+    }
+
+    static JsonNode BuildBatchTarget(string targetType, JsonNode node)
+    {
+        if (node is JsonArray array)
+        {
+            return array.DeepClone();
+        }
+        string value = node is JsonValue json && json.TryGetValue<string>(out string? text) ? text ?? "" : node.ToJsonString();
+        return BuildTarget(targetType, value);
     }
 
     [XmlFunction(FunctionMode.OneShot, "note_search")]
-    [Description("搜索 Obsidian 笔记库，返回 文件名 | 相关度 | 摘要 的精简列表，要看全文对中的笔记再走 note_read。simple 走 Obsidian 自带的全文搜索；jsonlogic 按笔记元数据（frontmatter、tags、path、content）写规则查")]
+    [Description("搜索 Obsidian 笔记库，返回 文件名 | 相关度 | 摘要；支持 page/limit 翻页。simple 走 Obsidian 全文搜索；jsonlogic 按 frontmatter/tags/path/content 规则查")]
     public async Task NoteSearch(
         [Description("simple 填关键词；jsonlogic 填 JSON 规则文本，如 {\"in\":[\"myTag\",{\"var\":\"tags\"}]}")] string query,
-        [Description("simple（默认）/ jsonlogic")] string searchType = "simple")
+        [Description("simple（默认）/ jsonlogic")] string searchType = "simple",
+        [Description("页码，从 1 起")] int page = 1,
+        [Description("每页条数，0=用配置默认值")] int limit = 0)
     {
         string text = query.Trim();
         if (text.Length == 0)
@@ -294,14 +402,164 @@ public partial class ObsidianModule(
         string body = resolvedType == "simple"
             ? await RequestAsync(HttpMethod.Post, "/search/simple/?query=" + Uri.EscapeDataString(text))
             : await RequestAsync(HttpMethod.Post, "/search/", text, TypeJsonLogic);
-        interactor.Poke(Truncate(FormatSearchResults(resolvedType == "simple", text, body)));
+        interactor.Poke(Truncate(FormatSearchResults(resolvedType == "simple", text, body, page, limit)));
+    }
+
+    [XmlFunction(FunctionMode.OneShot, "note_upload")]
+    [Description("上传附件到 vault（图片/PDF/音频等）。path=目标路径，localPath=本地文件绝对路径")]
+    public async Task NoteUpload(
+        [Description("vault 内目标路径，如 assets/pic.png")] string path,
+        [Description("本地文件绝对路径")] string localPath)
+    {
+        string normalized = RequirePath(path, "note_upload");
+        string source = localPath.Trim();
+        if (source.Length == 0 || File.Exists(source) == false)
+        {
+            throw new Exception("note_upload 找不到本地文件：" + localPath);
+        }
+        byte[] bytes = File.ReadAllBytes(source);
+        await RequestBinaryAsync(HttpMethod.Put, "/vault/" + normalized, bytes, GuessContentType(normalized));
+        TryAudit("上传附件 " + normalized + "（" + bytes.Length + " 字节）");
+        interactor.Poke("已上传 " + normalized + "（" + bytes.Length + " 字节）");
+    }
+
+    [XmlFunction(FunctionMode.OneShot, "note_move")]
+    [Description("移动或改名笔记/附件。fromPath、toPath 都是 vault 内相对路径；overwrite=false 时目标已存在会拒绝")]
+    public async Task NoteMove(
+        [Description("原路径")] string fromPath,
+        [Description("目标路径")] string toPath,
+        [Description("目标已存在时是否覆盖")] bool overwrite = false)
+    {
+        string from = RequirePath(fromPath, "note_move");
+        string to = RequirePath(toPath, "note_move");
+        (byte[] bytes, string contentType) = await RequestBytesAsync("/vault/" + from);
+        bool targetExists = true;
+        try
+        {
+            await RequestBytesAsync("/vault/" + to);
+        }
+        catch (Exception)
+        {
+            targetExists = false;
+        }
+        if (targetExists && overwrite == false)
+        {
+            throw new Exception("note_move 的目标已存在：" + to + "（要覆盖就把 overwrite 设为 true）");
+        }
+        await RequestBinaryAsync(HttpMethod.Put, "/vault/" + to, bytes, contentType);
+        await RequestAsync(HttpMethod.Delete, "/vault/" + from);
+        TryAudit("移动 " + from + " → " + to);
+        interactor.Poke("已移动 " + from + " → " + to + "（" + bytes.Length + " 字节）");
+    }
+
+    [XmlFunction(FunctionMode.OneShot, "note_rename")]
+    [Description("同目录改名。path=原路径，newName=新文件名（不带目录，可省略 .md）")]
+    public async Task NoteRename(
+        [Description("原路径")] string path,
+        [Description("新文件名，如 design-v2")] string newName)
+    {
+        string from = RequirePath(path, "note_rename");
+        string name = newName.Trim().Replace('\\', '/');
+        if (name.Length == 0 || name.Contains('/'))
+        {
+            throw new Exception("note_rename 的 newName 只给文件名，不带目录");
+        }
+        if (name.EndsWith(".md", StringComparison.OrdinalIgnoreCase) == false)
+        {
+            name += ".md";
+        }
+        int cut = from.LastIndexOf('/');
+        string target = cut >= 0 ? from[..cut] + "/" + name : name;
+        await NoteMove(from, target, false);
+    }
+
+    [XmlFunction(FunctionMode.OneShot, "note_env")]
+    [Description("检查 Obsidian REST 连接：地址、密钥是否填、认证是否通过、vault 与文件写入状态")]
+    public async Task NoteEnv()
+    {
+        StringBuilder lines = new();
+        lines.Append("REST 地址：").Append(baseUrl.Length > 0 ? baseUrl : "未配置");
+        lines.Append("\nAPI Key：").Append(Configuration.ApiKey.Length > 0
+            ? "已填（" + Configuration.ApiKey.Length + " 字符）" : "未填");
+        if (httpClient == null)
+        {
+            lines.Append("\n连接：未配置，note_* 工具不可用");
+        }
+        else
+        {
+            try
+            {
+                string body = await RequestAsync(HttpMethod.Get, "/");
+                lines.Append("\n认证：通过｜").Append(Cut(body, 180));
+            }
+            catch (Exception error)
+            {
+                lines.Append("\n连接/认证失败：").Append(Cut(error.Message, 180));
+            }
+        }
+        lines.Append("\nvault：").Append(vaultPath.Length > 0 ? vaultPath : "未配置");
+        lines.Append("｜文件系统写入：").Append(Configuration.WikiAllowFileWrite ? "开" : "关");
+        interactor.Poke(Truncate(lines.ToString()));
+    }
+
+    [XmlFunction(FunctionMode.OneShot, "kb_search")]
+    [Description("统一搜索：Obsidian 在跑先走 REST 全文搜索，失败或没开则用文件系统 BM25；返回文件/路径 + 摘要")]
+    public async Task KbSearch(
+        [Description("关键词")] string query,
+        [Description("最多几条，1-20")] int limit = 8,
+        [Description("文件侧过滤分区：sources/entities/concepts/analyses/external")] string section = "",
+        [Description("文件侧过滤标签")] string tag = "",
+        [Description("文件侧只看最近几天，0=不限")] int sinceDays = 0)
+    {
+        string text = query.Trim();
+        if (text.Length == 0)
+        {
+            throw new Exception("kb_search 缺关键词");
+        }
+        int count = Math.Clamp(limit, 1, 20);
+        if (httpClient != null)
+        {
+            try
+            {
+                string body = await RequestAsync(HttpMethod.Post, "/search/simple/?query=" + Uri.EscapeDataString(text));
+                interactor.Poke(Truncate("[REST] " + FormatSearchResults(true, text, body, 1, count)));
+                return;
+            }
+            catch (Exception error)
+            {
+                logger.LogWarning("[Obsidian] kb_search 的 REST 搜索失败，转文件系统：{Message}", error.Message);
+            }
+        }
+        string root = RequireVault(false);
+        VaultWiki.SearchOutcome outcome = await Task.Run(() => VaultWiki.Rank(root, text, count, 2600,
+            Math.Clamp(Configuration.MaxOutputChars, 500, 20000), section ?? "", tag ?? "", Math.Clamp(sinceDays, 0, 3650)));
+        if (outcome.Hits.Count == 0)
+        {
+            interactor.Poke("kb_search「" + text + "」没命中（扫了 " + outcome.ScannedPages + " 页）。");
+            return;
+        }
+        List<string> lines = new()
+        {
+            "[文件] 命中 " + outcome.Hits.Count + " 页（候选 " + outcome.Candidates + "）：",
+        };
+        for (int index = 0; index < outcome.Hits.Count; index++)
+        {
+            VaultWiki.SearchHit hit = outcome.Hits[index];
+            string snippet = hit.Snippet.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (snippet.Length > Configuration.SummaryMaxLength)
+            {
+                snippet = snippet[..Configuration.SummaryMaxLength] + "…";
+            }
+            lines.Add((index + 1) + ". " + hit.Rel + " | " + hit.Title + " | 相关度:" + hit.Score + " | " + snippet);
+        }
+        interactor.Poke(Truncate(string.Join("\n", lines)));
     }
 
     // ============================================================
     // 输出格式
     // ============================================================
 
-    string FormatSearchResults(bool isSimple, string query, string body)
+    string FormatSearchResults(bool isSimple, string query, string body, int page, int limit)
     {
         using JsonDocument document = JsonDocument.Parse(body);
         List<JsonElement> items = document.RootElement.EnumerateArray().ToList();
@@ -312,31 +570,40 @@ public partial class ObsidianModule(
                 : "JsonLogic 规则「" + query + "」没有命中任何笔记。规则里字段名可先拿 note_read mode=metadata 对照一篇真实笔记。";
         }
 
-        int shownCount = Math.Clamp(Configuration.MaxSearchResults, 1, 50);
+        int shownCount = limit > 0 ? Math.Clamp(limit, 1, 50) : Math.Clamp(Configuration.MaxSearchResults, 1, 50);
         int summaryLength = Math.Clamp(Configuration.SummaryMaxLength, 20, 1000);
         if (isSimple)
         {
             items = items.OrderByDescending(item => ReadScore(item)).ToList();
         }
+        int currentPage = Math.Max(page, 1);
+        int start = (currentPage - 1) * shownCount;
+        int totalPages = Math.Max((items.Count + shownCount - 1) / shownCount, 1);
+        int end = Math.Min(start + shownCount, items.Count);
+        if (start >= items.Count)
+        {
+            return "搜索「" + query + "」共 " + items.Count + " 条命中，只有 " + totalPages + " 页；page=" + currentPage + " 超出范围。";
+        }
         List<string> lines = new()
         {
-            "搜索「" + query + "」共 " + items.Count + " 条命中，显示前 " + Math.Min(shownCount, items.Count) + " 条：",
+            "搜索「" + query + "」共 " + items.Count + " 条命中，第 " + currentPage + "/" + totalPages
+                + " 页，显示 " + (start + 1) + "-" + end + " 条：",
         };
-        for (int index = 0; index < Math.Min(shownCount, items.Count); index++)
+        for (int index = start; index < end; index++)
         {
             JsonElement item = items[index];
             string filename = ReadString(item, "filename", "file", "未知文件");
             if (isSimple)
             {
-                lines.Add(index + 1 + ". " + filename + " | 相关度:" + ReadScore(item).ToString("0.00", CultureInfo.InvariantCulture)
+                lines.Add((index + 1) + ". " + filename + " | 相关度:" + ReadScore(item).ToString("0.00", CultureInfo.InvariantCulture)
                     + " | " + ReadContext(item, summaryLength));
                 continue;
             }
-            lines.Add(index + 1 + ". " + filename + " | " + ReadResult(item, summaryLength));
+            lines.Add((index + 1) + ". " + filename + " | " + ReadResult(item, summaryLength));
         }
-        if (items.Count > shownCount)
+        if (end < items.Count)
         {
-            lines.Add("… 还有 " + (items.Count - shownCount) + " 条没显示，可以把关键词收紧一点再搜，或把配置里的『搜索最多条数』调大。");
+            lines.Add("… 还有 " + (items.Count - end) + " 条，用 page=" + (currentPage + 1) + " 继续。");
         }
         lines.Add("看全文用 note_read 传上面的 filename。");
         return string.Join("\n", lines);
@@ -405,9 +672,118 @@ public partial class ObsidianModule(
         return text[..limit] + "\n…[输出已截断，超过 " + limit + " 字符]。要剩下的部分先用 note_read mode=structure 拿大纲，或 note_search 把目标缩小到某一节";
     }
 
+    /// <summary>note_* 的写操作也记一行维护日志；没配 vault 就静默跳过。</summary>
+    void TryAudit(string entry)
+    {
+        if (Configuration.WikiAllowFileWrite == false || vaultPath.Length == 0 || Directory.Exists(vaultPath) == false)
+        {
+            return;
+        }
+        try
+        {
+            VaultWiki.AppendLog(vaultPath, "note_* " + entry);
+        }
+        catch (Exception error)
+        {
+            logger.LogDebug("[Obsidian] 写维护日志失败：{Message}", error.Message);
+        }
+    }
+
     // ============================================================
     // 请求
     // ============================================================
+
+    /// <summary>Local REST API 把端口和密钥写在自己的 data.json 里，能读到就不用手抄。</summary>
+    void TryAutoDetectRestApi()
+    {
+        string configuredBase = Configuration.BaseUrl.Trim();
+        string configuredKey = Configuration.ApiKey.Trim();
+        if (configuredBase.Length > 0 && configuredKey.Length > 0)
+        {
+            return;
+        }
+        string vault = Configuration.VaultPath.Trim().TrimEnd('\\', '/');
+        if (vault.Length == 0)
+        {
+            return;
+        }
+        string dataFile = Path.Combine(vault, ".obsidian", "plugins", "obsidian-local-rest-api", "data.json");
+        if (!File.Exists(dataFile))
+        {
+            return;
+        }
+        try
+        {
+            JsonNode? data = JsonNode.Parse(File.ReadAllText(dataFile));
+            if (data == null)
+            {
+                return;
+            }
+            if (configuredKey.Length == 0)
+            {
+                string key = NodeText(data, "apiKey");
+                if (key.Length > 0)
+                {
+                    Configuration.ApiKey = key;
+                }
+            }
+            if (configuredBase.Length == 0)
+            {
+                int port = NodeInt(data, "port", 27124);
+                int insecurePort = NodeInt(data, "insecurePort", 27123);
+                bool secure = NodeBool(data, "enableSecureServer", true);
+                bool insecure = NodeBool(data, "enableInsecureServer", false);
+                Configuration.BaseUrl = secure || !insecure
+                    ? "https://127.0.0.1:" + port.ToString(CultureInfo.InvariantCulture)
+                    : "http://127.0.0.1:" + insecurePort.ToString(CultureInfo.InvariantCulture);
+            }
+            logger.LogInformation("[Obsidian] 已从 {File} 自动读取 REST 配置：{BaseUrl}", dataFile, Configuration.BaseUrl);
+        }
+        catch (Exception error)
+        {
+            logger.LogWarning("[Obsidian] 自动读取 {File} 失败：{Message}", dataFile, error.Message);
+        }
+    }
+
+    static string NodeText(JsonNode? node, string name)
+    {
+        JsonNode? value = node?[name];
+        return value?.GetValue<string>() ?? "";
+    }
+
+    static int NodeInt(JsonNode? node, string name, int fallback)
+    {
+        JsonNode? value = node?[name];
+        if (value == null)
+        {
+            return fallback;
+        }
+        try
+        {
+            return value.GetValue<int>();
+        }
+        catch (Exception)
+        {
+            return int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed) ? parsed : fallback;
+        }
+    }
+
+    static bool NodeBool(JsonNode? node, string name, bool fallback)
+    {
+        JsonNode? value = node?[name];
+        if (value == null)
+        {
+            return fallback;
+        }
+        try
+        {
+            return value.GetValue<bool>();
+        }
+        catch (Exception)
+        {
+            return bool.TryParse(value.ToString(), out bool parsed) ? parsed : fallback;
+        }
+    }
 
     HttpClient BuildHttpClient()
     {
@@ -438,6 +814,7 @@ public partial class ObsidianModule(
         }
 
         logger.LogDebug("[Obsidian] {Method} {Path}", method.Method, path);
+        patchWarnings = "";
         using HttpResponseMessage response = await SendAsync(client, request);
         string text = await response.Content.ReadAsStringAsync();
         ReportPatchWarnings(response, path);
@@ -446,6 +823,62 @@ public partial class ObsidianModule(
             throw new Exception(DescribeFailure((int)response.StatusCode, text, path));
         }
         return text;
+    }
+
+    /// <summary>上传附件用：正文是二进制，Content-Type 按扩展名给。</summary>
+    async Task<string> RequestBinaryAsync(HttpMethod method, string path, byte[] bytes, string contentType)
+    {
+        HttpClient client = httpClient ?? throw new Exception(NotConfiguredHint);
+        using HttpRequestMessage request = new(method, baseUrl + EncodePath(path));
+        ByteArrayContent content = new(bytes);
+        content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+        request.Content = content;
+        logger.LogDebug("[Obsidian] {Method} {Path} ({Bytes} bytes)", method.Method, path, bytes.Length);
+        patchWarnings = "";
+        using HttpResponseMessage response = await SendAsync(client, request);
+        string text = await response.Content.ReadAsStringAsync();
+        ReportPatchWarnings(response, path);
+        if (response.StatusCode >= HttpStatusCode.BadRequest)
+        {
+            throw new Exception(DescribeFailure((int)response.StatusCode, text, path));
+        }
+        return text;
+    }
+
+    /// <summary>移动/复制附件要拿原始字节和原 Content-Type。</summary>
+    async Task<(byte[] Bytes, string ContentType)> RequestBytesAsync(string path)
+    {
+        HttpClient client = httpClient ?? throw new Exception(NotConfiguredHint);
+        using HttpRequestMessage request = new(HttpMethod.Get, baseUrl + EncodePath(path));
+        using HttpResponseMessage response = await SendAsync(client, request);
+        if (response.StatusCode >= HttpStatusCode.BadRequest)
+        {
+            string text = await response.Content.ReadAsStringAsync();
+            throw new Exception(DescribeFailure((int)response.StatusCode, text, path));
+        }
+        string contentType = response.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
+        return (await response.Content.ReadAsByteArrayAsync(), contentType);
+    }
+
+    static string GuessContentType(string path)
+    {
+        return Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".svg" => "image/svg+xml",
+            ".pdf" => "application/pdf",
+            ".mp3" => "audio/mpeg",
+            ".wav" => "audio/wav",
+            ".mp4" => "video/mp4",
+            ".json" => "application/json",
+            ".css" => "text/css",
+            ".html" => "text/html",
+            ".txt" => "text/plain",
+            _ => "application/octet-stream",
+        };
     }
 
     static string EncodePath(string path)
@@ -498,7 +931,8 @@ public partial class ObsidianModule(
             return;
         }
         // 服务端把含中文的警告做了百分号编码，HTTP 头只允许 ASCII
-        logger.LogWarning("[Obsidian] {Path} 的补丁警告 {Warnings}", path, Uri.UnescapeDataString(string.Join("", values)));
+        patchWarnings = Uri.UnescapeDataString(string.Join("", values));
+        logger.LogWarning("[Obsidian] {Path} 的补丁警告 {Warnings}", path, patchWarnings);
     }
 
     string DescribeFailure(int statusCode, string body, string path)
@@ -548,10 +982,20 @@ public partial class ObsidianModule(
 
     static string RequirePath(string path, string toolName)
     {
-        string normalized = NormalizePath(path);
-        if (normalized.Length == 0)
+        string raw = path.Trim();
+        if (raw.Length == 0)
         {
             throw new Exception(toolName + " 缺 path：给 vault 内的相对路径，如 01-architecture/design.md");
+        }
+        if (raw.StartsWith('/') || raw.StartsWith('\\') || raw.StartsWith('~')
+            || (raw.Length >= 2 && char.IsLetter(raw[0]) && raw[1] == ':'))
+        {
+            throw new Exception(toolName + " 只收 vault 内相对路径，不给绝对路径、盘符或 ~：" + path);
+        }
+        string normalized = NormalizePath(path);
+        if (normalized.Length == 0 || normalized.Split('/').Any(segment => segment == ".."))
+        {
+            throw new Exception(toolName + " 的路径不能为空，也不能带 .. 穿越：" + path);
         }
         return normalized;
     }

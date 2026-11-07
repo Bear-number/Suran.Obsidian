@@ -47,8 +47,9 @@ public partial class ObsidianModule
         [Description("列几行最近维护日志，0=不列")] int recent = 5)
     {
         string root = RequireVault(false);
-        await Task.Run(() => { });
-        VaultWiki.LintReport report = check ? VaultWiki.Lint(root) : BuildStatsOnly(root);
+        VaultWiki.LintReport report = check
+            ? await Task.Run(() => VaultWiki.Lint(root, Configuration.CheckExternalLinks))
+            : BuildStatsOnly(root);
         List<string> lines = new()
         {
             "[" + Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar)) + "] 页面 " + report.Pages.Count
@@ -67,7 +68,7 @@ public partial class ObsidianModule
         }
         if (recent > 0)
         {
-            List<string> log = RecentLog(root, Math.Clamp(recent, 1, 40));
+            List<string> log = await Task.Run(() => RecentLog(root, Math.Clamp(recent, 1, 40)));
             if (log.Count > 0)
             {
                 lines.Add("  最近维护：");
@@ -94,15 +95,20 @@ public partial class ObsidianModule
     }
 
     [XmlFunction(FunctionMode.OneShot, "wiki_search")]
-    [Description("在知识库里按关键词找页（纯文件侧：中文按二字组、英文按词，标题命中权重高），返回 rel｜标题｜分区｜相关度 + 片段，受页数与字符双上限约束。与 note_search 的区别：这条不要求 Obsidian 在跑，也不读 Obsidian 的索引")]
+    [Description("在知识库里按关键词找页（纯文件侧，BM25 排序，标题/标签加权），支持 section/tag/最近天数过滤，返回 rel｜标题｜分区｜相关度 + 命中附近片段。与 note_search 的区别：不要求 Obsidian 在跑")]
     public async Task WikiSearch(
         [Description("关键词，中文或英文都行；留空等于按新鲜度列页")] string query,
         [Description("最多几页，1-20，默认 8")] int top = 8,
-        [Description("总字符预算，先到为止，默认 14000")] int budgetChars = 14000)
+        [Description("总字符预算，先到为止，默认 14000")] int budgetChars = 14000,
+        [Description("只搜某分区：sources/entities/concepts/analyses/external，留空全库")] string section = "",
+        [Description("只搜带该标签的页面，留空不限")] string tag = "",
+        [Description("只看最近几天，0=不限")] int sinceDays = 0)
     {
         string root = RequireVault(false);
         int pages = Math.Clamp(top, 1, 20);
-        VaultWiki.SearchOutcome outcome = await Task.Run(() => VaultWiki.Rank(root, query ?? "", pages, 2600, Math.Clamp(budgetChars, 2000, 60000)));
+        int effectiveBudget = Math.Min(Math.Clamp(budgetChars, 2000, 60000), Math.Clamp(Configuration.MaxOutputChars, 500, 20000));
+        VaultWiki.SearchOutcome outcome = await Task.Run(() => VaultWiki.Rank(root, query ?? "", pages, 2600, effectiveBudget,
+            section ?? "", tag ?? "", Math.Clamp(sinceDays, 0, 3650)));
         if (outcome.Hits.Count == 0)
         {
             interactor.Poke("wiki_search「" + query + "」没命中。扫了 " + outcome.ScannedPages + " 页（不含 index 等核心页）；"
@@ -162,7 +168,7 @@ public partial class ObsidianModule
         {
             string deleted = await Task.Run(() => VaultWiki.DeletePage(root, normalized));
             VaultWiki.AppendLog(root, "删除页面 " + deleted);
-            interactor.Poke("已删除 " + deleted + "（文件系统直接抹掉，不走 Obsidian 回收站——要留档就别删，改完改名挪走）");
+            interactor.Poke("已删除 " + deleted + "（挪进 vault 的 .trash/，Obsidian 和文件系统都还能找回）");
             return;
         }
         string content = context.FullContent;
@@ -175,19 +181,49 @@ public partial class ObsidianModule
             + (isGenerated ? "生成区" : "外部笔记") + "）。新建或大改页面后建议跑一次 wiki_index 更新索引");
     }
 
+    [XmlFunction(FunctionMode.OneShot, "wiki_rename")]
+    [Description("改名知识库页面，并把全库 [[旧名]] 替换成 [[新名]]（写操作）。oldPath/newPath 是库内相对路径")]
+    public async Task WikiRename(
+        [Description("原相对路径，如 entities/old.md")] string oldPath,
+        [Description("新相对路径，如 concepts/new.md")] string newPath,
+        [Description("是否同时替换全库双链，默认 true")] bool updateLinks = true)
+    {
+        string root = RequireVault(true);
+        (string rel, int updated) = await Task.Run(() => VaultWiki.RenamePage(root, oldPath, newPath, updateLinks));
+        VaultWiki.AppendLog(root, "改名 " + oldPath.Trim() + " → " + rel + "，更新双链 " + updated + " 个文件");
+        interactor.Poke("已改名 " + oldPath.Trim() + " → " + rel + "，更新双链 " + updated + " 个文件");
+    }
+
+    [XmlFunction(FunctionMode.OneShot, "wiki_merge")]
+    [Description("把 source 页面正文并入 target，并把指向 source 的双链改成 target（写操作）。默认 source 移入 .trash/")]
+    public async Task WikiMerge(
+        [Description("源页面相对路径")] string sourcePath,
+        [Description("目标页面相对路径")] string targetPath,
+        [Description("合并后是否删除源页面，默认 true")] bool deleteSource = true)
+    {
+        string root = RequireVault(true);
+        (string target, int updated, bool removed) = await Task.Run(() => VaultWiki.MergePages(root, sourcePath, targetPath, deleteSource));
+        VaultWiki.AppendLog(root, "合并 " + sourcePath.Trim() + " → " + target + "，更新双链 " + updated + " 个文件");
+        interactor.Poke("已合并 " + sourcePath.Trim() + " → " + target + "，更新双链 " + updated + " 个文件"
+            + (removed ? "，源页面已移入 .trash/" : ""));
+    }
+
     [XmlFunction(FunctionMode.Content, "wiki_ingest")]
-    [Description("把一段素材收进知识库：原文先落进 raw/，再让生成模型编译成来源摘要页与实体/概念/分析页（带 [[双链]]），最后重建索引并记日志。"
-        + "素材正文放在开闭标签之间（贴来的文章、聊天记录、随手笔记都行）。模型不可用时只存 raw/ 并如实说明——那时改用 wiki_page 自己写")]
+    [Description("把一段素材收进知识库：原文落进 raw/，再让生成模型编译成来源/实体/概念/分析页（带 [[双链]]），最后重建索引。支持 dryRun、conflictPolicy、tags")]
     public async Task WikiIngest(
         XmlExecutorContext context,
         [Description("素材标题，留空就取正文第一行")] string title = "",
-        [Description("来源链接，可留空（会写成一行 > 来源：）")] string sourceUrl = "")
+        [Description("来源链接，可留空")] string sourceUrl = "",
+        [Description("只生成计划、不落盘")] bool dryRun = false,
+        [Description("重名页处理：skip/merge/overwrite，默认 skip")] string conflictPolicy = "skip",
+        [Description("额外标签，逗号分隔，会写进新页 frontmatter")] string tags = "")
     {
         if (context.CallMode != CallMode.Closing)
         {
             return;
         }
-        string root = RequireVault(true);
+        string resolvedPolicy = RequireOneOf(conflictPolicy, "wiki_ingest 的 conflictPolicy", "skip", "merge", "overwrite");
+        string root = RequireVault(dryRun == false);
         string material = context.FullContent.Trim();
         if (material.Length == 0)
         {
@@ -199,7 +235,12 @@ public partial class ObsidianModule
             resolvedTitle = material.Split('\n')[0].Trim().TrimStart('#', ' ');
             resolvedTitle = resolvedTitle.Length > 40 ? resolvedTitle[..40] : resolvedTitle;
         }
-        (string rawRel, bool renamed) = await Task.Run(() => VaultWiki.SaveRaw(root, resolvedTitle, material, sourceUrl));
+        string rawRel = VaultWiki.Slugify(resolvedTitle) + ".md";
+        bool renamed = false;
+        if (dryRun == false)
+        {
+            (rawRel, renamed) = await Task.Run(() => VaultWiki.SaveRaw(root, resolvedTitle, material, sourceUrl));
+        }
         int limit = Math.Clamp(Configuration.IngestMaxPages, 1, 200);
 
         string reply;
@@ -220,27 +261,30 @@ public partial class ObsidianModule
         }
         catch (Exception modelError)
         {
-            interactor.Poke("素材已存进 raw/" + rawRel + "（" + material.Length + " 字符），但生成模型这次没通："
+            interactor.Poke((dryRun ? "[dryRun] " : "素材已存进 raw/" + rawRel + "（" + material.Length + " 字符），")
+                + (dryRun ? "未落盘；" : "但") + "生成模型这次没通："
                 + Cut(modelError.Message, 120) + "\n  编译页先没做；急着落页就用 wiki_page 自己写，写完跑 wiki_index");
             return;
         }
 
         (List<VaultWiki.Draft> drafts, int dropped, List<string> problems) =
-            VaultWiki.PlanCompiled(reply, rawRel, VaultWiki.Scan(root), limit);
-        int written = await Task.Run(() => VaultWiki.WriteDrafts(root, drafts));
+            VaultWiki.PlanCompiled(reply, rawRel, VaultWiki.Scan(root), limit, sourceUrl, tags);
+        int written = await Task.Run(() => VaultWiki.WriteDrafts(root, drafts, resolvedPolicy, dryRun));
         int skipped = drafts.Count - written;
-        if (written > 0)
+        if (written > 0 && dryRun == false)
         {
             await Task.Run(() =>
             {
                 VaultWiki.RebuildIndex(root);
-                VaultWiki.AppendLog(root, "收录 " + resolvedTitle + "：raw/" + rawRel + "，新建页面 " + written + " 条");
+                VaultWiki.AppendLog(root, "收录 " + resolvedTitle + "：raw/" + rawRel + "，新建页面 " + written + " 条（冲突策略 " + resolvedPolicy + "）");
             });
         }
         List<string> lines = new()
         {
-            "[" + resolvedTitle + "] 素材落在 raw/" + rawRel + (renamed ? "（同名，已加时间后缀）" : "")
-                + "｜编译出 " + drafts.Count + " 页，写了 " + written + " 页" + (skipped > 0 ? "，跳过 " + skipped + " 个重名" : "")
+            (dryRun ? "[dryRun] [" : "[") + resolvedTitle + "] "
+                + (dryRun ? "不会写 raw/ 与页面；" : "素材落在 raw/" + rawRel + (renamed ? "（同名，已加时间后缀）" : "") + "｜")
+                + "编译出 " + drafts.Count + " 页，" + (dryRun ? "计划写 " : "写了 ") + written + " 页"
+                + (skipped > 0 ? "，跳过 " + skipped + " 个重名" : "")
         };
         foreach (string problem in problems.Take(8))
         {
@@ -248,13 +292,14 @@ public partial class ObsidianModule
         }
         if (drafts.Count > 0)
         {
-            lines.Add("  新建的页：" + string.Join("、", drafts.Take(8).Select(draft => draft.Rel)) + (drafts.Count > 8 ? "…" : ""));
+            lines.Add("  页面：" + string.Join("、", drafts.Take(8).Select(draft => draft.Rel)) + (drafts.Count > 8 ? "…" : ""));
         }
         if (skipped > 0)
         {
-            lines.Add("  重名的页面没动（要覆盖就用 wiki_page mode=write 点名写，或先改个名）");
+            lines.Add("  重名页按 " + resolvedPolicy + " 处理（要逐个改就用 wiki_page，或先 wiki_rename）");
         }
-        lines.Add(written > 0 ? "  索引已按盘上页面重建，想看有没有断链空页跑 wiki_status"
+        lines.Add(dryRun ? "  dryRun 没有落盘；确认后去掉 dryRun 再跑"
+            : written > 0 ? "  索引已重建，想看断链空页跑 wiki_status"
             : "  这次只落了 raw/，索引没动");
         interactor.Poke(Truncate(string.Join("\n", lines)));
     }
@@ -293,6 +338,7 @@ public partial class ObsidianModule
         }
         report.RootPageCount = pages.Count(page => page.Section == "root");
         report.ContentBytes = pages.Where(page => page.Section != "root").Sum(page => page.Size);
+        report.RawCount = VaultWiki.CountRaw(root);
         return report;
     }
 

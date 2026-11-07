@@ -22,14 +22,79 @@ public static class VaultWiki
         ["sources"] = "来源", ["entities"] = "实体", ["concepts"] = "概念", ["analyses"] = "分析", [Imported] = "外部笔记"
     };
     public static readonly string[] RootPages = { "index", "log", "overview", "conventions" };
+    public const string IndexStart = "<!-- auto-index:start -->";
+    public const string IndexEnd = "<!-- auto-index:end -->";
     const long MaxPageBytes = 512 * 1024;
     const int MaxExternalPages = 5000;
     static readonly HashSet<string> ExternalSkipDirs = new(StringComparer.OrdinalIgnoreCase)
         { "wiki", "raw", "node_modules", "assets", "templates" };
     static readonly string[] RawExtensions = { ".md", ".txt", ".pdf", ".png", ".jpg", ".jpeg", ".webp" };
 
-    // 双链：[[目标]] / [[目标|别名]] / [[目标#标题]]，但 ![[嵌入]] 不算引用
+    /// <summary>数 raw/ 下的素材文件；wiki_status 只报统计时也要用它，别让素材数永远是 0。</summary>
+    public static int CountRaw(string root)
+    {
+        string rawFolder = Path.Combine(root, "raw");
+        if (!Directory.Exists(rawFolder))
+        {
+            return 0;
+        }
+        return Directory.EnumerateFiles(rawFolder, "*", SearchOption.AllDirectories)
+            .Count(file => RawExtensions.Contains(Path.GetExtension(file), StringComparer.OrdinalIgnoreCase));
+    }
+
+    // 全库扫描很贵：按路径缓存正文/分词/双链，文件 mtime+size 变了才重读
+    sealed class CachedText
+    {
+        public long Length;
+        public DateTime Modified;
+        public string Text = "";
+        public string Body = "";
+        public string[] Terms = Array.Empty<string>();
+        public string[] Links = Array.Empty<string>();
+    }
+
+    static readonly object TextCacheLock = new();
+    static readonly Dictionary<string, CachedText> TextCache = new(StringComparer.OrdinalIgnoreCase);
+
+    static CachedText GetCachedText(string file)
+    {
+        FileInfo info = new(file);
+        lock (TextCacheLock)
+        {
+            CachedText? cached = TextCache.GetValueOrDefault(file);
+            if (cached != null && cached.Length == info.Length && cached.Modified == info.LastWriteTimeUtc)
+            {
+                return cached;
+            }
+        }
+        string text = ReadText(file, MaxPageBytes);
+        (Dictionary<string, string> _, _, string body) = ParseFrontmatter(text);
+        string[] links = WikiLinkRegex.Matches(text).Cast<Match>()
+            .Select(link => link.Groups[1].Value.Trim().Split('/')[^1].Trim())
+            .Where(name => name.Length > 0)
+            .ToArray();
+        CachedText entry = new()
+        {
+            Length = info.Length,
+            Modified = info.LastWriteTimeUtc,
+            Text = text,
+            Body = body,
+            Terms = Terms(body),
+            Links = links,
+        };
+        lock (TextCacheLock)
+        {
+            if (TextCache.Count >= 800)
+            {
+                TextCache.Clear();
+            }
+            TextCache[file] = entry;
+        }
+        return entry;
+    }
+
     static readonly Regex WikiLinkRegex = new(@"(?<!\!)\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", RegexOptions.Compiled);
+    static readonly Regex AnyLinkRegex = new(@"\[\[([^\]|#]+)([|#][^\]]*)?\]\]", RegexOptions.Compiled);
     // Python 那份只认 \n，Windows 上 CRLF 的笔记会解析不出 frontmatter，这里补上 \r?\n
     static readonly Regex FrontmatterRegex = new(@"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?",
         RegexOptions.Singleline | RegexOptions.Compiled);
@@ -187,6 +252,30 @@ public static class VaultWiki
         return (fields, tags.ToArray(), text[match.Length..]);
     }
 
+    /// <summary>frontmatter 里的 aliases：支持 [a, b]、a,b 和单个值三种写法。</summary>
+    static IEnumerable<string> AliasNames(Dictionary<string, string> fields)
+    {
+        string raw = fields.TryGetValue("aliases", out string? aliases) && aliases.Length > 0
+            ? aliases
+            : fields.GetValueOrDefault("alias", "");
+        raw = raw.Trim();
+        if (raw.Length == 0)
+        {
+            return Array.Empty<string>();
+        }
+        if (raw.StartsWith('[') && raw.EndsWith(']'))
+        {
+            raw = raw[1..^1];
+        }
+        return raw.Split(',')
+            .Select(part => part.Trim().Trim('"', '\''))
+            .Where(part => part.Length > 0)
+            .ToArray();
+    }
+
+    static bool IsAssetName(string name) =>
+        RawExtensions.Contains(Path.GetExtension(name), StringComparer.OrdinalIgnoreCase);
+
     public static List<Page> Scan(string root, bool includeExternal = true)
     {
         List<Page> pages = new();
@@ -305,7 +394,7 @@ public static class VaultWiki
     // 体检与索引（体检只读，绝不落盘；重建索引才写）
     // ============================================================
 
-    public static LintReport Lint(string root)
+    public static LintReport Lint(string root, bool includeExternalLinks = false)
     {
         LintReport report = new();
         if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
@@ -318,6 +407,33 @@ public static class VaultWiki
         HashSet<string> names = pages.Select(page => page.Name).ToHashSet(StringComparer.Ordinal);
         //同名页面在真实 vault 里躲不掉（每个目录一个 README.md、index.md），
         //用 ToDictionary 会直接抛「An item with the same key has already been added」，所以按键去重、只留一份计数
+        Dictionary<string, int> nameCounts = new(StringComparer.Ordinal);
+        foreach (Page page in pages)
+        {
+            nameCounts[page.Name] = nameCounts.TryGetValue(page.Name, out int count) ? count + 1 : 1;
+            if (page.Size > MaxPageBytes)
+            {
+                report.Issues.Add(new Issue("warn", "超大页", page.Rel, "超过单页 512 KiB 上限，建议拆分"));
+            }
+        }
+        foreach (KeyValuePair<string, int> pair in nameCounts.Where(pair => pair.Value > 1))
+        {
+            report.Issues.Add(new Issue("info", "重名页", pair.Key, "有 " + pair.Value + " 个同名页面，双链会指向不确定的那一个"));
+        }
+        // Obsidian 的 [[别名]] 靠 frontmatter aliases 解析，不把别名也算进来会误报断链
+        Dictionary<string, string> aliases = new(StringComparer.Ordinal);
+        foreach (Page page in pages.Where(page => page.Section != "root"))
+        {
+            string head = ReadHead(PageFile(root, page), 4000);
+            (Dictionary<string, string> fields, _, _) = ParseFrontmatter(head);
+            foreach (string alias in AliasNames(fields))
+            {
+                if (alias.Length > 0 && names.Contains(alias) == false)
+                {
+                    aliases.TryAdd(alias, page.Name);
+                }
+            }
+        }
         Dictionary<string, int> incoming = new(StringComparer.Ordinal);
         foreach (Page page in pages)
         {
@@ -326,32 +442,33 @@ public static class VaultWiki
         foreach (Page page in pages.Where(page => page.Section != "root"))
         {
             string file = PageFile(root, page);
-            string text = ReadText(file, 400_000);
+            CachedText cached = GetCachedText(file);
+            string text = cached.Text;
             if (page.Generated && text.Trim().Length < 50)
             {
                 report.Issues.Add(new Issue("warn", "空页", page.Rel, "生成区页面正文不到 50 字"));
             }
-            foreach (Match link in WikiLinkRegex.Matches(text).Cast<Match>())
+            foreach (string targetName in cached.Links)
             {
-                string targetName = link.Groups[1].Value.Trim().Split('/')[^1].Trim();
                 if (targetName.Length == 0 || RootPages.Contains(targetName, StringComparer.OrdinalIgnoreCase))
                 {
                     continue;
                 }
-                if (!names.Contains(targetName))
+                if (!names.Contains(targetName) && aliases.ContainsKey(targetName) == false)
                 {
                     // 外部笔记爱引用没进扫描的附件与资源，只对生成区报断链，免得刷屏
-                    if (page.Generated)
+                    if ((page.Generated || includeExternalLinks) && IsAssetName(targetName) == false)
                     {
                         report.Issues.Add(new Issue("warn", "断链", page.Rel, "[[" + targetName + "]] 找不到对应页面"));
                     }
                     continue;
                 }
-                incoming[targetName] = incoming.TryGetValue(targetName, out int count) ? count + 1 : 1;
+                string canonical = names.Contains(targetName) ? targetName : aliases[targetName];
+                incoming[canonical] = incoming.TryGetValue(canonical, out int count) ? count + 1 : 1;
             }
         }
         foreach (Page page in pages.Where(page => page.Generated
-                     && (page.Section == "entities" || page.Section == "concepts")))
+                     && (page.Section == "entities" || page.Section == "concepts" || page.Section == "analyses")))
         {
             if (incoming.TryGetValue(page.Name, out int count) && count == 0)
             {
@@ -364,12 +481,7 @@ public static class VaultWiki
         }
         report.RootPageCount = pages.Count(page => page.Section == "root");
         report.ContentBytes = pages.Where(page => page.Section != "root").Sum(page => page.Size);
-        string rawFolder = Path.Combine(root, "raw");
-        if (Directory.Exists(rawFolder))
-        {
-            report.RawCount = Directory.EnumerateFiles(rawFolder, "*", SearchOption.AllDirectories)
-                .Count(file => RawExtensions.Contains(Path.GetExtension(file), StringComparer.OrdinalIgnoreCase));
-        }
+        report.RawCount = CountRaw(root);
         string logFile = Path.Combine(root, "wiki", "log.md");
         if (File.Exists(logFile))
         {
@@ -408,7 +520,7 @@ public static class VaultWiki
             Directory.CreateDirectory(Path.Combine(root, folder));
         }
         WriteIfMissing(Path.Combine(root, "wiki", "index.md"),
-            "# 知识库索引\n\n> 由笔记插件自动维护\n\n## 总览\n\n- [[overview]]\n");
+            "# 知识库索引\n\n> 由笔记插件自动维护\n\n" + IndexStart + "\n## 总览\n\n- [[overview]]\n" + IndexEnd + "\n");
         WriteIfMissing(Path.Combine(root, "wiki", "log.md"), "# 操作日志\n\n");
         WriteIfMissing(Path.Combine(root, "wiki", "overview.md"), "# 总览\n\n");
         WriteIfMissing(Path.Combine(root, "wiki", "conventions.md"),
@@ -439,29 +551,48 @@ public static class VaultWiki
     {
         EnsureStructure(root);
         List<Page> pages = Scan(root);
-        StringBuilder builder = new();
-        builder.Append("# 知识库索引\n\n> 由笔记插件自动维护\n\n## 总览\n\n- [[overview]]\n");
+        // 只重建标记块，保留用户在 index.md 里手写的其它段落
+        StringBuilder auto = new();
+        auto.Append("## 总览\n\n- [[overview]]\n");
         int total = 0;
         foreach (string section in Sections)
         {
             List<Page> inSection = pages.Where(page => page.Section == section).ToList();
-            builder.Append("\n## ").Append(SectionLabels[section]).Append("（").Append(inSection.Count).Append("）\n\n");
+            auto.Append("\n## ").Append(SectionLabels[section]).Append("（").Append(inSection.Count).Append("）\n\n");
             foreach (Page page in inSection)
             {
-                builder.Append("- [[").Append(page.Name).Append("]]\n");
+                auto.Append("- [[").Append(page.Name).Append("]]\n");
                 total++;
             }
         }
         List<Page> external = pages.Where(page => page.Section == Imported).ToList();
         if (external.Count > 0)
         {
-            builder.Append("\n## ").Append(SectionLabels[Imported]).Append("（").Append(external.Count).Append("）\n\n");
+            auto.Append("\n## ").Append(SectionLabels[Imported]).Append("（").Append(external.Count).Append("）\n\n");
             foreach (Page page in external)
             {
-                builder.Append("- [[").Append(page.Name).Append("]]\n");
+                auto.Append("- [[").Append(page.Name).Append("]]\n");
             }
         }
-        File.WriteAllText(Path.Combine(root, "wiki", "index.md"), builder.ToString(), new UTF8Encoding(false));
+        string indexFile = Path.Combine(root, "wiki", "index.md");
+        string existing = File.Exists(indexFile) ? ReadText(indexFile, MaxPageBytes) : "";
+        string block = IndexStart + "\n" + auto + IndexEnd;
+        int start = existing.IndexOf(IndexStart, StringComparison.Ordinal);
+        int end = start < 0 ? -1 : existing.IndexOf(IndexEnd, start, StringComparison.Ordinal);
+        string merged;
+        if (start >= 0 && end > start)
+        {
+            merged = existing[..start] + block + existing[(end + IndexEnd.Length)..];
+        }
+        else if (existing.Trim().Length == 0 || existing.Contains("> 由笔记插件自动维护", StringComparison.Ordinal))
+        {
+            merged = "# 知识库索引\n\n> 由笔记插件自动维护\n\n" + block + "\n";
+        }
+        else
+        {
+            merged = existing.TrimEnd() + "\n\n## 自动索引\n\n" + block + "\n";
+        }
+        File.WriteAllText(indexFile, merged, new UTF8Encoding(false));
         return total;
     }
 
@@ -488,34 +619,95 @@ public static class VaultWiki
         return terms.ToArray();
     }
 
-    public static SearchOutcome Rank(string root, string query, int topK = 8, int perPageChars = 2600, int budgetChars = 14000)
+    public static SearchOutcome Rank(string root, string query, int topK = 8, int perPageChars = 2600, int budgetChars = 14000,
+        string section = "", string tag = "", int sinceDays = 0)
     {
         SearchOutcome outcome = new();
         HashSet<string> wanted = Terms(query).ToHashSet(StringComparer.Ordinal);
-        List<(double Score, Page Page, string Body)> scored = new();
+        DateTime cutoff = sinceDays > 0 ? DateTime.UtcNow.AddDays(-sinceDays) : DateTime.MinValue;
+        List<(Page Page, string Body, string[] Terms)> docs = new();
+        Dictionary<string, int> documentFrequency = new(StringComparer.Ordinal);
+        double totalTerms = 0;
         foreach (Page page in Scan(root))
         {
             if (page.Section == "root")
             {
                 continue;
             }
-            outcome.ScannedPages++;
-            string text = ReadText(PageFile(root, page), 200_000);
-            string body = ParseFrontmatter(text).Body;
-            double score = 0;
-            if (wanted.Count == 0)
+            string wantedSection = section.Trim();
+            if (wantedSection.Length > 0
+                && string.Equals(page.Section, wantedSection, StringComparison.OrdinalIgnoreCase) == false
+                && (wantedSection.Equals("external", StringComparison.OrdinalIgnoreCase)
+                    || wantedSection.Equals("imported", StringComparison.OrdinalIgnoreCase)) == false)
             {
-                score = 0;
+                continue;
             }
-            else
+            if (wantedSection.Equals("external", StringComparison.OrdinalIgnoreCase)
+                || wantedSection.Equals("imported", StringComparison.OrdinalIgnoreCase))
             {
-                double overlap = Terms(body).Count(term => wanted.Contains(term));
-                double titleHit = Terms(page.Title).Count(term => wanted.Contains(term)) * 2;
-                score = overlap + titleHit * 3;
+                if (page.Section != Imported)
+                {
+                    continue;
+                }
+            }
+            if (tag.Trim().Length > 0 && page.Tags.Any(item => string.Equals(item, tag.Trim(), StringComparison.OrdinalIgnoreCase)) == false)
+            {
+                continue;
+            }
+            if (cutoff > DateTime.MinValue && page.Modified < cutoff)
+            {
+                continue;
+            }
+            outcome.ScannedPages++;
+            CachedText cached = GetCachedText(PageFile(root, page));
+            docs.Add((page, cached.Body, cached.Terms));
+            totalTerms += cached.Terms.Length;
+            if (wanted.Count > 0)
+            {
+                foreach (string term in wanted)
+                {
+                    if (cached.Terms.Contains(term, StringComparer.Ordinal))
+                    {
+                        documentFrequency[term] = documentFrequency.GetValueOrDefault(term, 0) + 1;
+                    }
+                }
+            }
+        }
+        int documentCount = docs.Count;
+        double averageLength = documentCount > 0 ? totalTerms / documentCount : 1;
+        List<(double Score, Page Page, string Body)> scored = new();
+        foreach ((Page Page, string Body, string[] Terms) doc in docs)
+        {
+            double score = 0;
+            if (wanted.Count > 0)
+            {
+                double length = Math.Max(doc.Terms.Length, 1);
+                foreach (string term in wanted)
+                {
+                    int tf = doc.Terms.Count(item => string.Equals(item, term, StringComparison.Ordinal));
+                    if (tf == 0)
+                    {
+                        continue;
+                    }
+                    int df = documentFrequency.GetValueOrDefault(term, 0);
+                    double idf = Math.Log(1 + (documentCount - df + 0.5) / (df + 0.5));
+                    score += idf * (tf * 2.2) / (tf + 1.2 * (1 - 0.75 + 0.75 * length / Math.Max(averageLength, 1)));
+                }
+                int titleHits = Terms(doc.Page.Title).Count(term => wanted.Contains(term));
+                score += titleHits * 2.5;
+                if (doc.Page.Tags.Any(item => wanted.Contains(item.ToLowerInvariant())))
+                {
+                    score += 1.5;
+                }
+                string trimmed = query.Trim();
+                if (trimmed.Length >= 2 && doc.Body.Contains(trimmed, StringComparison.OrdinalIgnoreCase))
+                {
+                    score += 2;
+                }
             }
             if (score > 0 || wanted.Count == 0)
             {
-                scored.Add((score, page, body));
+                scored.Add((score, doc.Page, doc.Body));
             }
         }
         outcome.Candidates = scored.Count;
@@ -526,12 +718,43 @@ public static class VaultWiki
             {
                 break;
             }
-            string snippet = entry.Body.Length > perPageChars ? entry.Body[..perPageChars] : entry.Body;
+            string snippet = SnippetAround(entry.Body, wanted, query, perPageChars);
             outcome.Chars += snippet.Length;
             outcome.Hits.Add(new SearchHit(entry.Page.Rel, entry.Page.Title, entry.Page.Section,
                 entry.Page.Generated, Math.Round(entry.Score, 2), snippet));
         }
         return outcome;
+    }
+
+    static string SnippetAround(string body, HashSet<string> wanted, string query, int max)
+    {
+        if (body.Length <= max)
+        {
+            return body;
+        }
+        int first = query.Trim().Length > 0 ? body.IndexOf(query.Trim(), StringComparison.OrdinalIgnoreCase) : -1;
+        if (first < 0)
+        {
+            foreach (string term in wanted)
+            {
+                int index = body.IndexOf(term, StringComparison.OrdinalIgnoreCase);
+                if (index >= 0 && (first < 0 || index < first))
+                {
+                    first = index;
+                }
+            }
+        }
+        if (first < 0)
+        {
+            first = 0;
+        }
+        int start = Math.Max(0, first - max / 3);
+        if (start + max > body.Length)
+        {
+            start = Math.Max(0, body.Length - max);
+        }
+        int length = Math.Min(max, body.Length - start);
+        return (start > 0 ? "…" : "") + body.Substring(start, length) + (start + length < body.Length ? "…" : "");
     }
 
     // ============================================================
@@ -558,8 +781,22 @@ public static class VaultWiki
         {
             throw new PathRejectedException("单页上限 512 KiB，这份有 " + bytes.LongLength + " 字节");
         }
-        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-        File.WriteAllText(target, body, new UTF8Encoding(false));
+        string directory = Path.GetDirectoryName(target)!;
+        Directory.CreateDirectory(directory);
+        // 先写临时文件再覆盖，避免进程中断把原页面留成半截
+        string temp = target + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            File.WriteAllText(temp, body, new UTF8Encoding(false));
+            File.Move(temp, target, true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+            {
+                File.Delete(temp);
+            }
+        }
         return (cleaned, generated, new FileInfo(target).Length);
     }
 
@@ -570,8 +807,121 @@ public static class VaultWiki
         {
             throw new PathRejectedException("index/log/overview/conventions 这四个核心页不给删");
         }
-        File.Delete(target);
-        return rel.Trim().Replace('\\', '/');
+        // 不物理删除：挪进 vault 的 .trash/，Obsidian 和用户都还能找回
+        string cleaned = rel.Trim().Replace('\\', '/');
+        string trash = Path.Combine(root, ".trash", cleaned.Replace('/', Path.DirectorySeparatorChar));
+        if (File.Exists(trash))
+        {
+            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+            trash = trash + "-" + stamp;
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(trash)!);
+        File.Move(target, trash);
+        return cleaned;
+    }
+
+    /// <summary>改名并把全库双链里的旧名换掉；返回更新了多少个文件。</summary>
+    public static (string NewRel, int UpdatedFiles) RenamePage(string root, string oldRel, string newRel, bool updateLinks = true)
+    {
+        string oldCleaned = (oldRel ?? "").Trim().Replace('\\', '/');
+        string newCleaned = (newRel ?? "").Trim().Replace('\\', '/');
+        (string oldTarget, _, _) = ResolveTarget(root, oldCleaned, mustExist: true);
+        (string newTarget, _, _) = ResolveTarget(root, newCleaned);
+        if (File.Exists(newTarget))
+        {
+            throw new PathRejectedException("目标页面已存在：" + newCleaned);
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(newTarget)!);
+        File.Move(oldTarget, newTarget);
+        string oldName = Path.GetFileNameWithoutExtension(oldTarget);
+        string newName = Path.GetFileNameWithoutExtension(newTarget);
+        int updated = updateLinks ? ReplaceLinks(root, oldName, newName) : 0;
+        return (newCleaned, updated);
+    }
+
+    /// <summary>把 source 正文并入 target，再把指向 source 的链接改成 target；source 进 .trash/。</summary>
+    public static (string Target, int UpdatedFiles, bool SourceRemoved) MergePages(string root, string sourceRel, string targetRel,
+        bool deleteSource = true)
+    {
+        string sourceCleaned = (sourceRel ?? "").Trim().Replace('\\', '/');
+        string targetCleaned = (targetRel ?? "").Trim().Replace('\\', '/');
+        (string sourceTarget, _, _) = ResolveTarget(root, sourceCleaned, mustExist: true);
+        (string targetTarget, _, _) = ResolveTarget(root, targetCleaned, mustExist: true);
+        if (sourceTarget == targetTarget)
+        {
+            throw new PathRejectedException("源页面和目标页面是同一个");
+        }
+        string sourceName = Path.GetFileNameWithoutExtension(sourceTarget);
+        string targetName = Path.GetFileNameWithoutExtension(targetTarget);
+        string sourceText = ReadText(sourceTarget, MaxPageBytes);
+        string sourceBody = ParseFrontmatter(sourceText).Body.Trim();
+        string targetText = ReadText(targetTarget, MaxPageBytes).TrimEnd();
+        string merged = targetText + "\n\n## 合并自 [[" + sourceName + "]]\n\n" + sourceBody + "\n";
+        WriteAtomic(targetTarget, merged);
+        int updated = ReplaceLinks(root, sourceName, targetName);
+        bool removed = false;
+        if (deleteSource)
+        {
+            DeletePage(root, sourceCleaned);
+            removed = true;
+        }
+        return (targetCleaned, updated, removed);
+    }
+
+    static int ReplaceLinks(string root, string oldName, string newName)
+    {
+        int updated = 0;
+        foreach (string file in Directory.EnumerateFiles(root, "*.md", SearchOption.AllDirectories))
+        {
+            string relative = Path.GetRelativePath(root, file).Replace('\\', '/');
+            string head = relative.Split('/')[0];
+            if (head.Equals(".trash", StringComparison.OrdinalIgnoreCase)
+                || head.Equals(".obsidian", StringComparison.OrdinalIgnoreCase)
+                || head.Equals("raw", StringComparison.OrdinalIgnoreCase)
+                || head.Equals("node_modules", StringComparison.OrdinalIgnoreCase)
+                || head.Equals("assets", StringComparison.OrdinalIgnoreCase)
+                || head.Equals("templates", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            string text = ReadText(file, MaxPageBytes);
+            string replaced = AnyLinkRegex.Replace(text, match =>
+            {
+                string targetPart = match.Groups[1].Value.Trim();
+                int slash = targetPart.LastIndexOf('/');
+                string prefix = slash >= 0 ? targetPart[..(slash + 1)] : "";
+                string stem = slash >= 0 ? targetPart[(slash + 1)..] : targetPart;
+                if (stem.Equals(oldName, StringComparison.OrdinalIgnoreCase) == false)
+                {
+                    return match.Value;
+                }
+                return "[[" + prefix + newName + (match.Groups[2].Value ?? "") + "]]";
+            });
+            if (replaced != text)
+            {
+                WriteAtomic(file, replaced);
+                updated++;
+            }
+        }
+        return updated;
+    }
+
+    static void WriteAtomic(string file, string text)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+        string temp = file + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            File.WriteAllText(temp, text, new UTF8Encoding(false));
+            File.Move(temp, file, true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+            {
+                File.Delete(temp);
+            }
+        }
     }
 
     // ============================================================
@@ -611,7 +961,7 @@ public static class VaultWiki
     /// 超过 maxPages 就截断并报数；顺带把模型回复里裹的说明文字剥掉。
     /// </summary>
     public static (List<Draft> Pages, int Dropped, List<string> Problems) PlanCompiled(string modelJson, string rawRel,
-        IReadOnlyCollection<Page> existing, int maxPages)
+        IReadOnlyCollection<Page> existing, int maxPages, string sourceUrl = "", string tags = "")
     {
         List<Draft> pages = new();
         List<string> problems = new();
@@ -655,9 +1005,19 @@ public static class VaultWiki
                     return;
                 }
                 StringBuilder builder = new();
+                List<string> pageTags = new() { section };
+                foreach (string extraTag in tags.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    pageTags.Add(extraTag);
+                }
                 builder.Append("---\ntitle: ").Append(trimmedName.Replace(':', ' '))
-                    .Append("\ntags: [").Append(section).Append("]\n---\n\n");
-                builder.Append("# ").Append(trimmedName).Append("\n\n").Append(body.Trim()).Append("\n\n");
+                    .Append("\ntags: [").Append(string.Join(", ", pageTags)).Append("]\n---\n\n");
+                builder.Append("# ").Append(trimmedName).Append("\n\n");
+                if (section == "sources" && sourceUrl.Trim().Length > 0)
+                {
+                    builder.Append("> 来源：").Append(sourceUrl.Trim()).Append("\n\n");
+                }
+                builder.Append(body.Trim()).Append("\n\n");
                 builder.Append("来源素材：[[").Append(rawLink).Append("]]\n");
                 pages.Add(new Draft(rel, trimmedName, builder.ToString(), existing.Any(page => page.Generated
                     && string.Equals(page.Name, Path.GetFileNameWithoutExtension(rel), StringComparison.Ordinal))));
@@ -717,17 +1077,49 @@ public static class VaultWiki
         element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement value)
         && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
 
-    /// <summary>按计划落盘，冲突的那些跳过不动。</summary>
-    public static int WriteDrafts(string root, IReadOnlyList<Draft> drafts)
+    /// <summary>按计划落盘；冲突页按 skip/merge/overwrite 处理，dryRun 时只算不写。</summary>
+    public static int WriteDrafts(string root, IReadOnlyList<Draft> drafts, string conflictPolicy = "skip", bool dryRun = false)
     {
+        string policy = conflictPolicy.Trim().ToLowerInvariant();
         int written = 0;
         foreach (Draft draft in drafts)
         {
             if (draft.Conflict)
             {
-                continue;
+                if (policy == "skip")
+                {
+                    continue;
+                }
+                if (policy == "merge")
+                {
+                    if (dryRun)
+                    {
+                        written++;
+                        continue;
+                    }
+                    (string target, _, _) = ResolveTarget(root, draft.Rel);
+                    if (File.Exists(target))
+                    {
+                        string old = ReadText(target, MaxPageBytes).TrimEnd();
+                        string body = ParseFrontmatter(draft.Body).Body.Trim();
+                        WriteAtomic(target, old + "\n\n## 补充\n\n" + body + "\n");
+                    }
+                    else
+                    {
+                        WritePage(root, draft.Rel, draft.Body);
+                    }
+                    written++;
+                    continue;
+                }
+                if (policy != "overwrite")
+                {
+                    continue;
+                }
             }
-            WritePage(root, draft.Rel, draft.Body);
+            if (dryRun == false)
+            {
+                WritePage(root, draft.Rel, draft.Body);
+            }
             written++;
         }
         return written;
